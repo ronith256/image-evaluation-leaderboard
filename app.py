@@ -1,7 +1,9 @@
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, Integer, String, Float
+from sqlalchemy import Column, Integer, String, Float, select
 from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.orm import sessionmaker
 from pydantic import BaseModel
 import os
@@ -27,9 +29,9 @@ app.add_middleware(
 )
 
 # Database setup
-SQLALCHEMY_DATABASE_URL = "sqlite:///./sql_app.db"
-engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SQLALCHEMY_DATABASE_URL = "sqlite+aiosqlite:///./sql_app.db"
+engine = create_async_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 Base = declarative_base()
 
@@ -42,8 +44,6 @@ class Submission(Base):
     student_roll_number = Column(String, index=True)
     file_path = Column(String)
     score = Column(Float)
-
-Base.metadata.create_all(bind=engine)
 
 # Pydantic models
 class SubmissionCreate(BaseModel):
@@ -58,14 +58,6 @@ class SubmissionResponse(BaseModel):
     student_roll_number: str
     file_path: str
     score: float
-
-# Helper function to get database session
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 # Load the ViT model and feature extractor
 model_name = "google/vit-base-patch16-224-in21k"
@@ -108,27 +100,36 @@ async def process_queue():
         finally:
             processing_queue.task_done()
 
-async def process_submission(db_submission):
-    db = next(get_db())
-    try:
-        # Convert PDF to image
-        image_path = pdf_to_image(db_submission.file_path, f"uploads/{db_submission.id}_image.jpg")
-        if not image_path:
-            raise HTTPException(status_code=400, detail="Failed to convert PDF to image")
+async def process_submission(submission_id: int):
+    async with SessionLocal() as db:
+        db_submission = await db.get(Submission, submission_id)
+        if not db_submission:
+            print(f"Submission {submission_id} not found")
+            return
 
-        # Calculate similarity score (assuming we have a reference image)
-        reference_image = "path/to/reference/image.jpg"  # You need to provide this
-        score = await asyncio.get_event_loop().run_in_executor(
-            executor, calculate_similarity, image_path, reference_image
-        )
+        try:
+            # Convert PDF to image
+            image_path = await asyncio.get_event_loop().run_in_executor(
+                executor, pdf_to_image, db_submission.file_path, f"uploads/{db_submission.id}_image.jpg"
+            )
+            if not image_path:
+                print(f"Failed to convert PDF to image for submission {submission_id}")
+                return
 
-        # Update database
-        db_submission.score = score
-        db.commit()
-    except Exception as e:
-        print(f"Error processing submission {db_submission.id}: {str(e)}")
-    finally:
-        db.close()
+            # Calculate similarity score (assuming we have a reference image)
+            reference_image = f"{db_submission.template_id}.jpeg"  # You need to provide this
+            score = await asyncio.get_event_loop().run_in_executor(
+                executor, calculate_similarity, image_path, reference_image
+            )
+            print(f"Calculated score for submission {submission_id}: {score}")
+
+            # Update database
+            db_submission.score = score
+            await db.commit()
+            print(f"Updated score for submission {submission_id}")
+        except Exception as e:
+            print(f"Error processing submission {submission_id}: {str(e)}")
+            await db.rollback()
 
 @app.post("/submit", response_model=SubmissionResponse)
 async def submit(
@@ -148,20 +149,20 @@ async def submit(
         buffer.write(await pdf_file.read())
 
     # Save to database
-    db = next(get_db())
-    db_submission = Submission(
-        template_id=template_id,
-        student_name=student_name,
-        student_roll_number=student_roll_number,
-        file_path=file_path,
-        score=0.0  # Initial score
-    )
-    db.add(db_submission)
-    db.commit()
-    db.refresh(db_submission)
+    async with SessionLocal() as db:
+        db_submission = Submission(
+            template_id=template_id,
+            student_name=student_name,
+            student_roll_number=student_roll_number,
+            file_path=file_path,
+            score=0.0  # Initial score
+        )
+        db.add(db_submission)
+        await db.commit()
+        await db.refresh(db_submission)
 
     # Add processing task to queue
-    task = process_submission(db_submission)
+    task = process_submission(db_submission.id)
     await processing_queue.put(task)
 
     return SubmissionResponse(
@@ -175,22 +176,26 @@ async def submit(
 
 @app.get("/getdata", response_model=List[SubmissionResponse])
 async def get_data(template_id: str):
-    db = next(get_db())
-    submissions = db.query(Submission).filter(Submission.template_id == template_id).all()
-    return [
-        SubmissionResponse(
-            id=submission.id,
-            template_id=submission.template_id,
-            student_name=submission.student_name,
-            student_roll_number=submission.student_roll_number,
-            file_path=submission.file_path,
-            score=submission.score
-        )
-        for submission in submissions
-    ]
+    async with SessionLocal() as db:
+        query = select(Submission).where(Submission.template_id == template_id)
+        result = await db.execute(query)
+        submissions = result.scalars().all()
+        return [
+            SubmissionResponse(
+                id=submission.id,
+                template_id=submission.template_id,
+                student_name=submission.student_name,
+                student_roll_number=submission.student_roll_number,
+                file_path=submission.file_path,
+                score=submission.score
+            )
+            for submission in submissions
+        ]
 
 @app.on_event("startup")
 async def startup_event():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
     asyncio.create_task(process_queue())
 
 if __name__ == "__main__":
