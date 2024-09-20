@@ -22,3 +22,11 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+__pycache__
+sql_app.db
+*.jpeg
+*.png
+*.pdf
+uploads
+public
